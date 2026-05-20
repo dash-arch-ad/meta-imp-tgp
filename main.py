@@ -14,8 +14,8 @@ DEFAULT_WORKSHEET_NAME = "gitreport"
 # 媒体ごとの実行可否。使わない媒体は False にすると、
 # その媒体の取得処理をスキップし、secrets 側が空でもエラーにしません。
 ENABLE_META = True
-ENABLE_TIKTOK = True
-ENABLE_GOOGLE = True
+ENABLE_TIKTOK = False
+ENABLE_GOOGLE = False
 
 
 def main():
