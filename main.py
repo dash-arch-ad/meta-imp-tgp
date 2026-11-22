@@ -1,4 +1,13 @@
+import hashlib
+import logging
+import math
 import os
+import re
+import secrets
+import sys
+import time
+import uuid
+from urllib.parse import parse_qs, urlsplit
 import json
 import requests
 import gspread
@@ -6,7 +15,7 @@ from zoneinfo import ZoneInfo
 from datetime import datetime, date, timedelta
 from oauth2client.service_account import ServiceAccountCredentials
 
-META_API_VERSION = "v25.0"
+META_API_VERSION = "v27.0"
 GOOGLE_ADS_API_VERSION = "v23"
 JST = ZoneInfo("Asia/Tokyo")
 DEFAULT_WORKSHEET_NAME = "gitreport"
@@ -18,14 +27,34 @@ ENABLE_TIKTOK = False
 ENABLE_GOOGLE = False
 
 
+class ExportError(Exception):
+    """Safe for logs. Messages contain only fixed labels and validated numbers."""
+
+
 def main():
     print("=== Start Unified Reach Export ===")
     config = load_secret()
-    mask_sensitive_values(config)
 
     resolved = resolve_config(config)
     validate_config(resolved)
 
+    dest = resolved["sheet"]
+    book = connect_spreadsheet(dest["spreadsheet_id"], dest["google_service_account"])
+    lease = acquire_lease(book, dest["worksheet_name"])
+    if lease is None:
+        print("Export skipped: another run owns the destination.")
+        return
+    try:
+        rows = collect_rows(resolved)
+        write_to_sheet(book, dest["worksheet_name"], rows, lease)
+    except BaseException:
+        release_lease(book, lease)
+        raise
+    print(f"Total rows written: {len(rows)}")
+    print("=== Completed ===")
+
+
+def collect_rows(resolved):
     all_monthly_ranges, monthly_ranges, daily_since, daily_until = get_target_date_ranges()
 
     all_monthly_range_text = ", ".join(
@@ -82,58 +111,18 @@ def main():
         google_rows = []
         print("Google Ads skipped")
 
-    all_rows = sort_rows(meta_rows + tiktok_rows + google_rows)
-
-    spreadsheet = connect_spreadsheet(
-        sheet_id=resolved["sheet"]["spreadsheet_id"],
-        google_creds_dict=resolved["sheet"]["google_service_account"],
-    )
-    write_to_sheet(
-        spreadsheet=spreadsheet,
-        sheet_name=resolved["sheet"]["worksheet_name"],
-        rows=all_rows,
-    )
-
-    print(f"Total rows written: {len(all_rows)}")
-    print("=== Completed ===")
+    return sort_rows(meta_rows + tiktok_rows + google_rows)
 
 
 def load_secret():
     secret_env = os.environ.get("APP_SECRET_JSON")
     if not secret_env:
-        raise RuntimeError("APP_SECRET_JSON is not set")
+        raise ExportError("APP_SECRET_JSON is not set")
 
     try:
         return json.loads(secret_env)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"APP_SECRET_JSON is invalid JSON: {e}") from e
-
-
-def mask_sensitive_values(config):
-    candidates = []
-
-    def push(value):
-        if value is None:
-            return
-        value = str(value).strip()
-        if not value:
-            return
-        if "\n" in value:
-            return
-        candidates.append(value)
-
-    meta = config.get("meta", {})
-    tiktok = config.get("tiktok", {})
-
-    push(meta.get("token"))
-    push(config.get("m_token"))
-    push(meta.get("account_id"))
-    push(config.get("m_act_id"))
-    push(tiktok.get("access_token"))
-    push(tiktok.get("advertiser_id"))
-
-    for value in sorted(set(candidates)):
-        print(f"::add-mask::{value}")
+    except json.JSONDecodeError:
+        raise ExportError("APP_SECRET_JSON is invalid JSON.") from None
 
 
 def resolve_config(config):
@@ -211,7 +200,7 @@ def validate_config(resolved):
 
     missing = [k for k, v in required.items() if not v]
     if missing:
-        raise RuntimeError(f"Missing required config keys: {', '.join(missing)}")
+        raise ExportError(f"Missing required config keys: {', '.join(missing)}")
 
 
 def normalize_google_service_account(creds):
@@ -240,6 +229,8 @@ def normalize_meta_act_id(raw_act_id):
         .replace("act", "")
         .strip()
     )
+    if not re.fullmatch(r"[0-9]+", cleaned):
+        raise ExportError("Invalid Meta account ID.")
     return f"act_{cleaned}"
 
 
@@ -518,50 +509,105 @@ def fetch_meta_rows(
     return rows
 
 
+def api_json(service, method, url, **kwargs):
+    try:
+        response = requests.request(method, url, timeout=120, allow_redirects=False, **kwargs)
+    except requests.RequestException:
+        raise ExportError(f"{service} connection failed.") from None
+    status = response.status_code
+    try:
+        data = response.json()
+    except ValueError:
+        raise ExportError(f"{service} invalid JSON (HTTP {status}).") from None
+    has_error = isinstance(data, dict) and "error" in data
+    if not 200 <= status < 300 or has_error:
+        error = data.get("error") if has_error else None
+        details = ""
+        if isinstance(error, dict):
+            for key in ("code", "error_subcode"):
+                if type(error.get(key)) is int:
+                    details += f", {key}={error[key]}"
+        raise ExportError(f"{service} failed (HTTP {status}{details}).")
+    return data
+
+
+def valid_count(value):
+    if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+        return False
+    try:
+        number = float(value)
+        return math.isfinite(number) and number >= 0
+    except (ValueError, OverflowError):
+        return False
+
+
+def validate_meta_row(row, fields, since, until, daily):
+    if not isinstance(row, dict) or not valid_count(row.get("reach")):
+        raise ExportError("Meta returned invalid reach.")
+    recall = row.get("estimated_ad_recallers")
+    if recall not in (None, "") and not valid_count(recall):
+        raise ExportError("Meta returned invalid estimated ad recallers.")
+    for field in fields:
+        if field.endswith("_name") and not isinstance(row.get(field), str):
+            raise ExportError("Meta returned an invalid name.")
+    if daily:
+        try:
+            day = date.fromisoformat(row["date_start"])
+            if not since <= day <= until or day.isoformat() != row["date_start"]:
+                raise ValueError
+        except (KeyError, TypeError, ValueError):
+            raise ExportError("Meta returned an invalid date.") from None
+
+
+def next_cursor(data, endpoint):
+    paging = data.get("paging", {})
+    if not isinstance(paging, dict):
+        raise ExportError("Meta returned invalid paging.")
+    if "next" not in paging:
+        return None
+    link = paging["next"]
+    if not isinstance(link, str):
+        raise ExportError("Meta returned an invalid next page.")
+    parts = urlsplit(link)
+    if (parts.scheme != "https" or parts.netloc != "graph.facebook.com"
+            or parts.path != urlsplit(endpoint).path or parts.fragment):
+        raise ExportError("Meta returned an unexpected next page.")
+    query = parse_qs(parts.query, keep_blank_values=True)
+    after = query.get("after", [])
+    if len(after) != 1 or not after[0] or any(k in query for k in ("before", "offset", "__paging_token")):
+        raise ExportError("Meta returned unsupported pagination.")
+    cursors = paging.get("cursors", {})
+    if not isinstance(cursors, dict) or cursors.get("after", after[0]) != after[0]:
+        raise ExportError("Meta returned inconsistent cursors.")
+    return after[0]
+
+
 def fetch_meta_insights(act_id, token, since, until, time_increment, level, fields):
     url = f"https://graph.facebook.com/{META_API_VERSION}/{act_id}/insights"
     params = {
-        "access_token": token,
         "level": level,
-        "time_range": json.dumps(
-            {
-                "since": since.strftime("%Y-%m-%d"),
-                "until": until.strftime("%Y-%m-%d"),
-            }
-        ),
+        "time_range": json.dumps({"since": since.isoformat(), "until": until.isoformat()}),
         "fields": ",".join(fields),
         "time_increment": time_increment,
         "limit": 5000,
     }
-
+    headers = {"Authorization": f"Bearer {token}"}
     all_rows = []
-
+    seen = set()
     while True:
-        response = requests.get(url, params=params, timeout=120)
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as e:
-            raise RuntimeError(
-                f"Meta API request failed. status={response.status_code}, body={truncate_text(response.text)}"
-            ) from e
-
-        data = response.json()
-        if "error" in data:
-            raise RuntimeError(
-                f"Meta API error: {json.dumps(data['error'], ensure_ascii=False)}"
-            )
-
-        batch = data.get("data", [])
-        all_rows.extend(batch)
-
-        next_url = data.get("paging", {}).get("next")
-        if not next_url:
-            break
-
-        url = next_url
-        params = None
-
-    return all_rows
+        data = api_json("Meta API", "GET", url, headers=headers, params=params)
+        if not isinstance(data, dict) or not isinstance(data.get("data"), list):
+            raise ExportError("Meta returned an invalid data array.")
+        for row in data["data"]:
+            validate_meta_row(row, fields, since, until, time_increment == "1")
+            all_rows.append(row)
+        after = next_cursor(data, url)
+        if after is None:
+            return all_rows
+        if after in seen:
+            raise ExportError("Meta pagination repeated a cursor.")
+        seen.add(after)
+        params["after"] = after
 
 
 def fetch_tiktok_rows(
@@ -575,17 +621,9 @@ def fetch_tiktok_rows(
 ):
     rows = []
 
-    def safe_fetch(scope_name, **kwargs):
-        try:
-            return fetch_tiktok_report(**kwargs)
-        except RuntimeError as e:
-            print(f"Warning: TikTok {scope_name} skipped: {e}")
-            return []
-
     # all（月次）のみ過去6ヶ月
     for month_range in all_monthly_ranges:
-        batch = safe_fetch(
-            "all",
+        batch = fetch_tiktok_report(
             advertiser_id=advertiser_id,
             access_token=access_token,
             data_level="AUCTION_ADVERTISER",
@@ -607,8 +645,7 @@ def fetch_tiktok_rows(
 
     # day（日次）
     for chunk_since, chunk_until in split_date_ranges(daily_fetch_since, output_until, 30):
-        batch = safe_fetch(
-            "day",
+        batch = fetch_tiktok_report(
             advertiser_id=advertiser_id,
             access_token=access_token,
             data_level="AUCTION_ADVERTISER",
@@ -636,8 +673,7 @@ def fetch_tiktok_rows(
 
     # campaign_day（日次）
     for chunk_since, chunk_until in split_date_ranges(daily_fetch_since, output_until, 30):
-        batch = safe_fetch(
-            "campaign_day",
+        batch = fetch_tiktok_report(
             advertiser_id=advertiser_id,
             access_token=access_token,
             data_level="AUCTION_CAMPAIGN",
@@ -666,8 +702,7 @@ def fetch_tiktok_rows(
 
     # その他の月別は既存どおり
     for month_range in monthly_ranges:
-        batch = safe_fetch(
-            "campaign",
+        batch = fetch_tiktok_report(
             advertiser_id=advertiser_id,
             access_token=access_token,
             data_level="AUCTION_CAMPAIGN",
@@ -688,8 +723,7 @@ def fetch_tiktok_rows(
                 )
             )
 
-        batch = safe_fetch(
-            "adset",
+        batch = fetch_tiktok_report(
             advertiser_id=advertiser_id,
             access_token=access_token,
             data_level="AUCTION_ADGROUP",
@@ -711,8 +745,7 @@ def fetch_tiktok_rows(
                 )
             )
 
-        batch = safe_fetch(
-            "ad",
+        batch = fetch_tiktok_report(
             advertiser_id=advertiser_id,
             access_token=access_token,
             data_level="AUCTION_AD",
@@ -773,35 +806,47 @@ def fetch_tiktok_report(
             "multi_adv_report_in_utc_time": "false",
         }
 
-        response = requests.get(url, headers=headers, params=params, timeout=120)
-        try:
-            response.raise_for_status()
-        except requests.HTTPError as e:
-            raise RuntimeError(
-                f"TikTok report API request failed. status={response.status_code}, body={truncate_text(response.text)}"
-            ) from e
-
-        payload = response.json()
-        code = payload.get("code")
-        if code not in (0, "0"):
-            raise RuntimeError(
-                f"TikTok report API error: code={code}, message={payload.get('message')}, request_id={payload.get('request_id')}"
-            )
-
-        data = payload.get("data", {})
-        batch = data.get("list", [])
+        payload = api_json("TikTok API", "GET", url, headers=headers, params=params)
+        if not isinstance(payload, dict) or str(payload.get("code")) != "0":
+            raise ExportError("TikTok API rejected the report.")
+        data = payload.get("data")
+        if not isinstance(data, dict) or not isinstance(data.get("list"), list):
+            raise ExportError("TikTok returned an invalid report.")
+        batch = data["list"]
+        for item in batch:
+            if not isinstance(item, dict):
+                raise ExportError("TikTok returned an invalid row.")
+            for metric in metrics:
+                value = extract_tiktok_metric(item, metric)
+                if metric == "reach" and not valid_count(value):
+                    raise ExportError("TikTok returned invalid reach.")
+                if metric.endswith("_name") and not isinstance(value, str):
+                    raise ExportError("TikTok returned an invalid name.")
+            for field in dimensions:
+                value = extract_tiktok_dimension(item, field)
+                if value in (None, ""):
+                    raise ExportError("TikTok returned an invalid dimension.")
+                if field == "stat_time_day" and not is_in_date_range(value, since, until):
+                    raise ExportError("TikTok returned an invalid date.")
         all_rows.extend(batch)
+        info = data.get("page_info")
+        if not isinstance(info, dict):
+            raise ExportError("TikTok returned invalid paging.")
+        try:
+            total = int(info["total_page"])
+            count = int(info["total_number"])
+            actual_page = int(info.get("page", page))
+        except (KeyError, TypeError, ValueError):
+            raise ExportError("TikTok returned invalid paging.") from None
+        if actual_page != page or total < 0 or count < 0:
+            raise ExportError("TikTok returned inconsistent paging.")
+        if page >= total:
+            if len(all_rows) != count:
+                raise ExportError("TikTok returned an incomplete report.")
+            break
+        if not batch:
+            raise ExportError("TikTok returned an incomplete page.")
 
-        page_info = data.get("page_info", {})
-        total_page = to_int(page_info.get("total_page"))
-        total_number = to_int(page_info.get("total_number"))
-
-        if total_page and page >= total_page:
-            break
-        if total_number and page * page_size >= total_number:
-            break
-        if len(batch) < page_size:
-            break
 
         page += 1
 
@@ -832,7 +877,7 @@ def extract_tiktok_metric(item, key):
     if key in item:
         return item.get(key)
 
-    return "" if key in {"campaign_name", "adgroup_name", "ad_name"} else 0
+    return None
 
 
 def fetch_google_ads_rows(
@@ -991,28 +1036,18 @@ def fetch_google_ads_rows(
 
 
 def refresh_google_ads_access_token(client_id, client_secret, refresh_token):
-    response = requests.post(
-        "https://oauth2.googleapis.com/token",
+    payload = api_json(
+        "Google OAuth", "POST", "https://oauth2.googleapis.com/token",
         data={
             "client_id": client_id,
             "client_secret": client_secret,
             "refresh_token": refresh_token,
             "grant_type": "refresh_token",
         },
-        timeout=120,
     )
-
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as e:
-        raise RuntimeError(
-            f"Google OAuth token refresh failed. status={response.status_code}, body={truncate_text(response.text)}"
-        ) from e
-
-    payload = response.json()
-    access_token = payload.get("access_token")
-    if not access_token:
-        raise RuntimeError(f"Google OAuth token refresh returned no access_token: {payload}")
+    access_token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not isinstance(access_token, str) or not access_token:
+        raise ExportError("Google OAuth returned no access token.")
 
     print("Google Ads OAuth token refreshed successfully")
     return access_token
@@ -1042,34 +1077,32 @@ def google_ads_search_stream(
     if summary_row_setting:
         body["summaryRowSetting"] = summary_row_setting
 
-    response = requests.post(url, headers=headers, json=body, timeout=120)
-
-    try:
-        response.raise_for_status()
-    except requests.HTTPError as e:
-        raise RuntimeError(
-            f"Google Ads API request failed. status={response.status_code}, body={truncate_text(response.text)}"
-        ) from e
-
-    payload = response.json()
-
-    if isinstance(payload, dict) and "error" in payload:
-        raise RuntimeError(
-            f"Google Ads API error: {truncate_text(json.dumps(payload['error'], ensure_ascii=False))}"
-        )
-
+    payload = api_json("Google Ads API", "POST", url, headers=headers, json=body)
     if not isinstance(payload, list):
-        raise RuntimeError(
-            f"Google Ads API unexpected response shape: {truncate_text(json.dumps(payload, ensure_ascii=False))}"
-        )
-
+        raise ExportError("Google Ads returned an invalid report.")
     all_rows = []
     summary_row = None
-
     for chunk in payload:
-        all_rows.extend(chunk.get("results", []))
-        if chunk.get("summaryRow"):
+        if (not isinstance(chunk, dict) or "error" in chunk
+                or not any(k in chunk for k in ("results", "summaryRow", "fieldMask", "requestId"))):
+            raise ExportError("Google Ads returned an invalid chunk.")
+        batch = chunk.get("results", [])
+        if not isinstance(batch, list):
+            raise ExportError("Google Ads returned invalid results.")
+        for row in batch:
+            if not isinstance(row, dict) or not valid_count(get_nested(row, "metrics", "uniqueUsers")):
+                raise ExportError("Google Ads returned invalid reach.")
+            if "campaign.name" in query and not isinstance(get_nested(row, "campaign", "name", default=None), str):
+                raise ExportError("Google Ads returned an invalid name.")
+            if "segments.date," in query:
+                date.fromisoformat(get_nested(row, "segments", "date"))
+        all_rows.extend(batch)
+        if "summaryRow" in chunk:
             summary_row = chunk["summaryRow"]
+            if not valid_count(get_nested(summary_row, "metrics", "uniqueUsers")):
+                raise ExportError("Google Ads returned an invalid summary.")
+    if summary_row_setting and all_rows and summary_row is None:
+        raise ExportError("Google Ads returned an incomplete summary.")
 
     return {
         "results": all_rows,
@@ -1090,34 +1123,158 @@ def connect_spreadsheet(sheet_id, google_creds_dict):
         spreadsheet = client.open_by_key(sheet_id)
         print("Google Sheets connected successfully")
         return spreadsheet
-    except Exception as e:
-        raise RuntimeError(f"Google Sheets connection error: {repr(e)}") from e
+    except Exception:
+        raise ExportError("Google Sheets connection failed.") from None
 
 
-def write_to_sheet(spreadsheet, sheet_name, rows):
-    header = [[
-        "media",
-        "scope",
-        "period",
-        "campaign_name",
-        "adset_name",
-        "ad_name",
-        "unique_reach",
-        "unique_ad_recall_lift",
-    ]]
+HEADER = ["media", "scope", "period", "campaign_name", "adset_name", "ad_name",
+          "unique_reach", "unique_ad_recall_lift"]
+LEASE_SECONDS = 3600
 
+
+def sheet_state(book):
+    return book.fetch_sheet_metadata(params={
+        "fields": "sheets(properties(sheetId,title,sheetType,gridProperties(rowCount,columnCount))),"
+                  "namedRanges(namedRangeId,name)"
+    })
+
+
+def range_names(state):
+    return {item["name"]: item["namedRangeId"] for item in state.get("namedRanges", [])}
+
+
+def delete_range(range_id):
+    return {"deleteNamedRange": {"namedRangeId": range_id}}
+
+
+def add_range(name, range_id, sheet_id):
+    return {"addNamedRange": {"namedRange": {
+        "name": name, "namedRangeId": range_id,
+        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": 1,
+                  "startColumnIndex": 0, "endColumnIndex": 1},
+    }}}
+
+
+def lease_time(range_id):
+    match = re.fullmatch(r"tgp_([0-9]+)_[0-9a-f]{32}", range_id)
+    if not match:
+        raise ExportError("Unexpected Sheets lock. Check named ranges.")
+    return int(match.group(1))
+
+
+def acquire_lease(book, title):
+    # All runners compete for one unique name. Each acquisition uses a fresh ID.
+    key = hashlib.sha256(title.casefold().encode()).hexdigest()[:24]
+    lock = "tgp_lock_" + key
+    state = sheet_state(book)
+    existing = range_names(state).get(lock)
+    now = int(time.time())
+    if existing and now < lease_time(existing) + LEASE_SECONDS:
+        return None
+    token = f"tgp_{now}_{uuid.uuid4().hex}"
+    anchor = next(s["properties"]["sheetId"] for s in state["sheets"]
+                  if s["properties"].get("sheetType", "GRID") == "GRID")
+    lease = {"id": token, "name": lock, "receipt_prefix": "tgp_done_" + key + "_",
+             "anchor": anchor}
+    ops = [delete_range(existing)] if existing else []
+    ops.append(add_range(lock, token, anchor))
     try:
-        try:
-            worksheet = spreadsheet.worksheet(sheet_name)
-        except gspread.WorksheetNotFound:
-            worksheet = spreadsheet.add_worksheet(title=sheet_name, rows=1000, cols=8)
+        book.batch_update({"requests": ops})
+    except Exception:
+        owner = range_names(sheet_state(book)).get(lock)
+        if owner == token:
+            return lease
+        if owner and owner != existing:
+            return None
+        raise ExportError("Sheets lock acquisition failed.") from None
+    return lease
 
-        worksheet.clear()
-        output = header + rows
-        worksheet.update("A1", output)
-        print(f"Write success: {sheet_name} ({len(rows)} rows)")
-    except Exception as e:
-        raise RuntimeError(f"Write error ({sheet_name}): {repr(e)}") from e
+
+def release_lease(book, lease):
+    # IDs are never reused. A delayed cleanup cannot unlock the successor.
+    try:
+        if range_names(sheet_state(book)).get(lease["name"]) == lease["id"]:
+            book.batch_update({"requests": [delete_range(lease["id"])]})
+    except Exception:
+        print("Sheets lock cleanup unconfirmed. Expiry permits recovery.", file=sys.stderr)
+
+
+def previous_report_height(book, title, new_height):
+    escaped = title.replace("'", "''")
+    result = book.values_get(f"'{escaped}'!A:H", params={"valueRenderOption": "FORMULA"})
+    values = result.get("values", [])
+    height = 0
+    if values and values[0] == HEADER:
+        height = 1
+        for row in values[1:]:
+            if len(row) < 3 or row[0] not in {"meta", "tiktok", "google"}:
+                break
+            if row[1] not in {"all", "day", "campaign_day", "campaign", "adset", "ad"}:
+                break
+            height += 1
+    if any(any(cell != "" for cell in row) for row in values[height:new_height]):
+        raise ExportError("Sheets output overlaps existing non-report data.")
+    return height
+
+
+def write_to_sheet(book, title, rows, lease):
+    state = sheet_state(book)
+    names = range_names(state)
+    if names.get(lease["name"]) != lease["id"]:
+        raise ExportError("Sheets lock ownership changed.")
+    # A missing owner ID invalidates this *whole* batch even after the preliminary read.
+    receipt_id = "receipt_" + lease["id"]
+    receipt = lease["receipt_prefix"] + lease["id"]
+    ops = [{"updateNamedRange": {"namedRange": {"namedRangeId": lease["id"], "name": receipt},
+                                 "fields": "name"}},
+           delete_range(lease["id"]), add_range(receipt, receipt_id, lease["anchor"])]
+    # Keep receipts long enough for a timed-out writer to confirm its own commit.
+    cutoff = int(time.time()) - 86400
+    for name, range_id in names.items():
+        saved_token = range_id.removeprefix("receipt_")
+        if name == lease["receipt_prefix"] + saved_token and lease_time(saved_token) < cutoff:
+            ops.append(delete_range(range_id))
+    props = next((s["properties"] for s in state["sheets"]
+                  if s["properties"]["title"] == title), None)
+    output = [HEADER, *rows]
+    if props is None:
+        sheet_id = secrets.randbelow(2**31 - 1) + 1
+        height = len(output)
+        ops.append({"addSheet": {"properties": {
+            "sheetId": sheet_id, "title": title,
+            "gridProperties": {"rowCount": max(1000, height), "columnCount": len(HEADER)},
+        }}})
+    else:
+        sheet_id = props["sheetId"]
+        grid = props["gridProperties"]
+        height = max(len(output), previous_report_height(book, title, len(output)))
+        for dimension, current, needed in (("ROWS", grid["rowCount"], height),
+                                            ("COLUMNS", grid["columnCount"], len(HEADER))):
+            if needed > current:
+                ops.append({"appendDimension": {"sheetId": sheet_id, "dimension": dimension,
+                                                "length": needed - current}})
+    # updateCells with an explicit range clears only surplus values in the old report.
+    cell_rows = []
+    for row in output:
+        cells = []
+        for value in row:
+            field = "numberValue" if isinstance(value, (int, float)) else "stringValue"
+            cells.append({"userEnteredValue": {field: value}})
+        cell_rows.append({"values": cells})
+    ops.append({"updateCells": {
+        "range": {"sheetId": sheet_id, "startRowIndex": 0, "endRowIndex": height,
+                  "startColumnIndex": 0, "endColumnIndex": len(HEADER)},
+        "rows": cell_rows, "fields": "userEnteredValue",
+    }})
+    try:
+        book.batch_update({"requests": ops})
+    except Exception:
+        try:
+            confirmed = range_names(sheet_state(book)).get(receipt) == receipt_id
+        except Exception:
+            raise ExportError("Sheets commit could not be confirmed.") from None
+        if not confirmed:
+            raise ExportError("Sheets commit was not confirmed.") from None
 
 
 def sort_rows(rows):
@@ -1184,12 +1341,14 @@ def to_int(value):
         return 0
 
 
-def truncate_text(value, limit=800):
-    value = str(value)
-    if len(value) <= limit:
-        return value
-    return value[:limit] + ".(truncated)"
+
 
 
 if __name__ == "__main__":
-    main()
+    logging.disable(logging.CRITICAL)
+    try:
+        main()
+    except ExportError as exc:
+        sys.exit(str(exc))
+    except Exception:
+        sys.exit("Export failed: unexpected configuration, service, or response error.")
